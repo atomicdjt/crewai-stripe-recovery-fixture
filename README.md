@@ -10,12 +10,13 @@ It accompanies the discussion in [CrewAI issue #6414](https://github.com/crewAII
 - Provider observations are append-only evidence records containing `observed_at`, `lookup_method`, `authority`, raw response, and provider reference.
 - A lost response becomes `UNKNOWN`, never `NOT_COMMITTED`.
 - Retry uses the same idempotency key only within the configured retention window.
-- A provider response commits only when provider reference, amount/currency, and `metadata.operation_id` all correlate.
-- The custom tool exposes `safe_to_assume_committed: false` for every non-committed outcome.
+- A response is classified as `INTENT_CREATED` only when provider ID, amount/currency, and `metadata.operation_id` correlate. This describes creation of the unconfirmed PaymentIntent resource, not payment completion.
+- Uncorrelated candidate provider IDs are preserved in append-only evidence but never promoted to the operation's trusted retrieval reference.
+- The custom tool reports `payment_confirmation_attempted: false`; it does not claim that a payment completed.
 
 ## What this does not claim
 
-It is not an upstream CrewAI patch, a distributed exactly-once proof, or proof of Stripe's guarantees. The included tests use a fault-injectable behavioural double; they do **not** call Stripe. No live Stripe test-mode result is included in this repository.
+It is not an upstream CrewAI patch, a distributed exactly-once proof, or proof of Stripe's guarantees. The included tests use a fault-injectable behavioural double; they do **not** call Stripe. No live Stripe test-mode result is included in this repository. The probe creates only an unconfirmed PaymentIntent; it does not confirm or complete a payment.
 
 ## Run deterministic fault injection
 

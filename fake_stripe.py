@@ -7,6 +7,7 @@ class FakeStripeTestMode:
     def __init__(self) -> None:
         self.intents: dict[str, dict[str, Any]] = {}
         self.by_key: dict[str, str] = {}
+        self.retrieved_references: list[str] = []
         self.lose_next_create_response = False
         self.fail_next_retrieve = False
         self.hide_retrieval = False
@@ -21,6 +22,7 @@ class FakeStripeTestMode:
             raise LostResponse("simulated response loss after provider commit")
         return dict(response)
     def retrieve_payment_intent(self, provider_reference: str) -> Mapping[str, Any] | None:
+        self.retrieved_references.append(provider_reference)
         if self.fail_next_retrieve:
             self.fail_next_retrieve = False
             raise ProviderUnavailable("simulated provider 5xx")

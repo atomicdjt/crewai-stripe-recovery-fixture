@@ -21,7 +21,7 @@ from typing import Any, Mapping, Protocol
 class EffectState(str, Enum):
     PENDING = "PENDING"
     UNKNOWN = "UNKNOWN"
-    COMMITTED = "COMMITTED"
+    INTENT_CREATED = "INTENT_CREATED"
     NOT_COMMITTED = "NOT_COMMITTED"
 
 
@@ -110,14 +110,19 @@ class OperationJournal:
         return self._operation(row)
 
     def observe(self, operation_id: str, *, state: EffectState, lookup_method: str,
-                authority: str, provider_reference: str | None, raw: Mapping[str, Any]) -> Operation:
+                authority: str, provider_reference: str | None, raw: Mapping[str, Any],
+                promote_provider_reference: bool = False) -> Operation:
         if authority not in {"provider", "application"}:
             raise ValueError("authority must be provider or application")
         self.db.execute("INSERT INTO evidence(operation_id, observed_at, lookup_method, authority, provider_reference, state, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (operation_id, time.time(), lookup_method, authority, provider_reference,
                          state.value, json.dumps(raw, sort_keys=True)))
+        # Evidence may contain a candidate provider ID even when it fails
+        # correlation. Only explicitly correlated provider evidence can make
+        # an ID a trusted future retrieval target.
+        trusted_reference = provider_reference if promote_provider_reference else None
         self.db.execute("UPDATE operations SET state=?, provider_reference=COALESCE(?, provider_reference) WHERE operation_id=?",
-                        (state.value, provider_reference, operation_id))
+                        (state.value, trusted_reference, operation_id))
         self.db.commit()
         return self.get(operation_id)
 
@@ -135,7 +140,7 @@ class PaymentIntentBoundary:
 
     def create(self, *, amount: int, currency: str = "usd", operation_id: str | None = None) -> Operation:
         op = self.journal.begin(amount=amount, currency=currency, operation_id=operation_id)
-        if op.state is EffectState.COMMITTED:
+        if op.state is EffectState.INTENT_CREATED:
             return op
         if op.state is EffectState.UNKNOWN:
             return self.recover(op.operation_id)
@@ -150,7 +155,7 @@ class PaymentIntentBoundary:
 
     def recover(self, operation_id: str) -> Operation:
         op = self.journal.get(operation_id)
-        if op.state is EffectState.COMMITTED:
+        if op.state is EffectState.INTENT_CREATED:
             return op
         if op.provider_reference:
             try:
@@ -182,18 +187,19 @@ class PaymentIntentBoundary:
             return self.journal.observe(op.operation_id, state=EffectState.UNKNOWN, lookup_method=lookup_method,
                 authority="provider", provider_reference=str(reference) if reference else None,
                 raw=dict(response))
-        return self.journal.observe(op.operation_id, state=EffectState.COMMITTED, lookup_method=lookup_method,
-            authority="provider", provider_reference=str(reference), raw=dict(response))
+        return self.journal.observe(op.operation_id, state=EffectState.INTENT_CREATED, lookup_method=lookup_method,
+            authority="provider", provider_reference=str(reference), raw=dict(response),
+            promote_provider_reference=True)
 
 
 class CrewAIPaymentIntentTool:
     """Minimal CrewAI custom-tool shape. Subclass BaseTool in a CrewAI app if desired."""
     name = "create_or_recover_payment_intent"
-    description = "Creates or reconciles a Stripe test-mode PaymentIntent with durable operation evidence."
+    description = "Creates or reconciles an unconfirmed Stripe test-mode PaymentIntent; does not confirm or complete a payment."
     def __init__(self, boundary: PaymentIntentBoundary) -> None:
         self.boundary = boundary
     def _run(self, amount: int, currency: str = "usd", operation_id: str | None = None) -> dict[str, Any]:
         op = self.boundary.create(amount=amount, currency=currency, operation_id=operation_id)
-        return {"operation_id": op.operation_id, "effect_state": op.state.value,
+        return {"operation_id": op.operation_id, "intent_state": op.state.value,
                 "provider_reference": op.provider_reference,
-                "safe_to_assume_committed": op.state is EffectState.COMMITTED}
+                "payment_confirmation_attempted": False}
