@@ -20,6 +20,7 @@ from typing import Any, Mapping, Protocol
 
 class EffectState(str, Enum):
     PENDING = "PENDING"
+    DISPATCHING = "DISPATCHING"
     UNKNOWN = "UNKNOWN"
     INTENT_CREATED = "INTENT_CREATED"
     NOT_COMMITTED = "NOT_COMMITTED"
@@ -43,6 +44,7 @@ class Operation:
     idempotency_key: str
     provider_reference: str | None
     created_at: float
+    dispatch_started_at: float | None
 
 
 class PaymentGateway(Protocol):
@@ -76,7 +78,7 @@ class OperationJournal:
           operation_id TEXT PRIMARY KEY, payload_digest TEXT NOT NULL,
           amount INTEGER NOT NULL, currency TEXT NOT NULL, state TEXT NOT NULL,
           idempotency_key TEXT NOT NULL UNIQUE, provider_reference TEXT,
-          created_at REAL NOT NULL
+          created_at REAL NOT NULL, dispatch_started_at REAL
         );
         CREATE TABLE IF NOT EXISTS evidence (
           evidence_id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL,
@@ -85,6 +87,21 @@ class OperationJournal:
           raw_json TEXT NOT NULL, FOREIGN KEY(operation_id) REFERENCES operations(operation_id)
         );
         """)
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(operations)")}
+        if "dispatch_started_at" not in columns:
+            # A pre-fence PENDING row may already have reached the provider
+            # before a crash. Fence it as ambiguous instead of replaying it as
+            # a new first dispatch after an upgrade.
+            self.db.execute("ALTER TABLE operations ADD COLUMN dispatch_started_at REAL")
+            self.db.execute(
+                "UPDATE operations SET state=?, dispatch_started_at=created_at WHERE state=?",
+                (EffectState.UNKNOWN.value, EffectState.PENDING.value),
+            )
+        # Preserve compatibility with journals written before the resource-
+        # creation state was renamed to avoid implying payment completion.
+        self.db.execute("UPDATE operations SET state=? WHERE state='COMMITTED'",
+                        (EffectState.INTENT_CREATED.value,))
+        self.db.commit()
 
     def begin(self, *, amount: int, currency: str, operation_id: str | None = None) -> Operation:
         if amount <= 0:
@@ -97,7 +114,7 @@ class OperationJournal:
                 raise ValueError("operation_id cannot be reused with a different payload")
             return self._operation(old)
         now = time.time()
-        self.db.execute("INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+        self.db.execute("INSERT INTO operations (operation_id, payload_digest, amount, currency, state, idempotency_key, provider_reference, created_at, dispatch_started_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL)",
                         (operation_id, digest, amount, currency.lower(), EffectState.PENDING.value,
                          _idempotency_key(operation_id), now))
         self.db.commit()
@@ -109,14 +126,70 @@ class OperationJournal:
             raise KeyError(operation_id)
         return self._operation(row)
 
+    def begin_dispatch(self, operation_id: str) -> bool:
+        """Durably fence a first provider call before crossing the boundary."""
+        now = time.time()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self.db.execute(
+                "UPDATE operations SET state=?, dispatch_started_at=? "
+                "WHERE operation_id=? AND state=?",
+                (EffectState.DISPATCHING.value, now, operation_id, EffectState.PENDING.value),
+            )
+            if cursor.rowcount != 1:
+                self.db.rollback()
+                return False
+            op = self.get(operation_id)
+            self._append_evidence(operation_id, observed_at=now,
+                lookup_method="dispatch_started", authority="application",
+                provider_reference=None, state=EffectState.DISPATCHING,
+                raw={"idempotency_key": op.idempotency_key, "attempt": "initial"})
+            self.db.commit()
+            return True
+        except BaseException:
+            self.db.rollback()
+            raise
+
+    def record_retry_dispatch(self, operation_id: str) -> None:
+        """Persist an in-window retry attempt without resetting the first-use clock."""
+        now = time.time()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT idempotency_key FROM operations WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(operation_id)
+            self.db.execute("UPDATE operations SET state=? WHERE operation_id=?",
+                            (EffectState.DISPATCHING.value, operation_id))
+            self._append_evidence(operation_id, observed_at=now,
+                lookup_method="retry_dispatch_started", authority="application",
+                provider_reference=None, state=EffectState.DISPATCHING,
+                raw={"idempotency_key": row["idempotency_key"], "attempt": "retry"})
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+
+    def _append_evidence(self, operation_id: str, *, observed_at: float,
+                         lookup_method: str, authority: str,
+                         provider_reference: str | None, state: EffectState,
+                         raw: Mapping[str, Any]) -> None:
+        self.db.execute(
+            "INSERT INTO evidence(operation_id, observed_at, lookup_method, authority, provider_reference, state, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (operation_id, observed_at, lookup_method, authority, provider_reference,
+             state.value, json.dumps(raw, sort_keys=True)),
+        )
+
     def observe(self, operation_id: str, *, state: EffectState, lookup_method: str,
                 authority: str, provider_reference: str | None, raw: Mapping[str, Any],
                 promote_provider_reference: bool = False) -> Operation:
         if authority not in {"provider", "application"}:
             raise ValueError("authority must be provider or application")
-        self.db.execute("INSERT INTO evidence(operation_id, observed_at, lookup_method, authority, provider_reference, state, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (operation_id, time.time(), lookup_method, authority, provider_reference,
-                         state.value, json.dumps(raw, sort_keys=True)))
+        self._append_evidence(operation_id, observed_at=time.time(),
+            lookup_method=lookup_method, authority=authority,
+            provider_reference=provider_reference, state=state, raw=raw)
         # Evidence may contain a candidate provider ID even when it fails
         # correlation. Only explicitly correlated provider evidence can make
         # an ID a trusted future retrieval target.
@@ -129,7 +202,8 @@ class OperationJournal:
     @staticmethod
     def _operation(row: sqlite3.Row) -> Operation:
         return Operation(row["operation_id"], row["payload_digest"], row["amount"], row["currency"],
-                         EffectState(row["state"]), row["idempotency_key"], row["provider_reference"], row["created_at"])
+                         EffectState(row["state"]), row["idempotency_key"], row["provider_reference"],
+                         row["created_at"], row["dispatch_started_at"])
 
 
 class PaymentIntentBoundary:
@@ -142,8 +216,14 @@ class PaymentIntentBoundary:
         op = self.journal.begin(amount=amount, currency=currency, operation_id=operation_id)
         if op.state is EffectState.INTENT_CREATED:
             return op
-        if op.state is EffectState.UNKNOWN:
+        if op.state in {EffectState.UNKNOWN, EffectState.DISPATCHING}:
             return self.recover(op.operation_id)
+        if not self.journal.begin_dispatch(op.operation_id):
+            # Another caller already owns the first dispatch or has advanced
+            # the operation. Return its durable projection without sending a
+            # second request from this invocation.
+            return self.journal.get(op.operation_id)
+        op = self.journal.get(op.operation_id)
         try:
             response = self.gateway.create_payment_intent(amount=op.amount, currency=op.currency,
                 idempotency_key=op.idempotency_key, metadata={"operation_id": op.operation_id})
@@ -157,6 +237,9 @@ class PaymentIntentBoundary:
         op = self.journal.get(operation_id)
         if op.state is EffectState.INTENT_CREATED:
             return op
+        if op.state is EffectState.PENDING:
+            return self.create(amount=op.amount, currency=op.currency,
+                               operation_id=op.operation_id)
         if op.provider_reference:
             try:
                 response = self.gateway.retrieve_payment_intent(op.provider_reference)
@@ -167,9 +250,15 @@ class PaymentIntentBoundary:
                 return self.journal.observe(op.operation_id, state=EffectState.UNKNOWN, lookup_method="retrieve_not_found",
                     authority="provider", provider_reference=op.provider_reference, raw={})
             return self._record_provider_response(op, response, "retrieve")
-        if time.time() - op.created_at > self.idempotency_window_seconds:
+        dispatch_started_at = op.dispatch_started_at
+        age = time.time() - dispatch_started_at if dispatch_started_at is not None else None
+        if age is None or age < 0 or age >= self.idempotency_window_seconds:
             return self.journal.observe(op.operation_id, state=EffectState.UNKNOWN, lookup_method="retry_refused_window_expired",
-                authority="application", provider_reference=None, raw={"window_seconds": self.idempotency_window_seconds})
+                authority="application", provider_reference=None,
+                raw={"window_seconds": self.idempotency_window_seconds,
+                     "dispatch_age_seconds": age,
+                     "reason": "missing_or_expired_dispatch_timestamp"})
+        self.journal.record_retry_dispatch(op.operation_id)
         try:
             response = self.gateway.create_payment_intent(amount=op.amount, currency=op.currency,
                 idempotency_key=op.idempotency_key, metadata={"operation_id": op.operation_id})

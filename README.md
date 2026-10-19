@@ -9,14 +9,16 @@ It accompanies the discussion in [CrewAI issue #6414](https://github.com/crewAII
 - One operation ID binds one canonical amount/currency payload.
 - Provider observations are append-only evidence records containing `observed_at`, `lookup_method`, `authority`, raw response, and provider reference.
 - A lost response becomes `UNKNOWN`, never `NOT_COMMITTED`.
-- Retry uses the same idempotency key only within the configured retention window.
+- The journal durably records `DISPATCHING` and the first dispatch timestamp before calling the provider. A crash after provider acceptance cannot leave a fresh `PENDING` row that looks safe to dispatch again.
+- Recovery reuses the same idempotency key only within the configured retention window measured from first dispatch. Once that window expires, the outcome remains `UNKNOWN` and no create retry is sent.
+- On upgrade from an earlier journal schema, existing `PENDING` rows are conservatively converted to `UNKNOWN` and fenced using their creation time, since the older schema cannot prove whether dispatch happened.
 - A response is classified as `INTENT_CREATED` only when provider ID, amount/currency, and `metadata.operation_id` correlate. This describes creation of the unconfirmed PaymentIntent resource, not payment completion.
 - Uncorrelated candidate provider IDs are preserved in append-only evidence but never promoted to the operation's trusted retrieval reference.
 - The custom tool reports `payment_confirmation_attempted: false`; it does not claim that a payment completed.
 
 ## What this does not claim
 
-It is not an upstream CrewAI patch, a distributed exactly-once proof, or proof of Stripe's guarantees. The included tests use a fault-injectable behavioural double; they do **not** call Stripe. No live Stripe test-mode result is included in this repository. The probe creates only an unconfirmed PaymentIntent; it does not confirm or complete a payment.
+It is not an upstream CrewAI patch, a distributed exactly-once proof, or proof of Stripe's guarantees. The included tests use a fault-injectable behavioural double, including a simulated process crash after provider acceptance; they do **not** call Stripe. No live Stripe test-mode result is included in this repository. The probe creates only an unconfirmed PaymentIntent; it does not confirm or complete a payment.
 
 ## Run deterministic fault injection
 

@@ -1,8 +1,9 @@
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
-from fake_stripe import FakeStripeTestMode
+from fake_stripe import FakeStripeTestMode, SimulatedProcessCrash
 from operation_journal import CrewAIPaymentIntentTool, EffectState, OperationJournal, PaymentIntentBoundary
 
 class RecoveryTests(unittest.TestCase):
@@ -69,6 +70,75 @@ class RecoveryTests(unittest.TestCase):
         time.sleep(0.01)
         self.assertEqual(short.recover("expired").state, EffectState.UNKNOWN)
         self.assertEqual(len(self.gateway.intents), 1)
+
+    def test_post_dispatch_crash_after_window_is_not_replayed(self):
+        self.gateway.crash_after_next_create = True
+        with self.assertRaises(SimulatedProcessCrash):
+            self.boundary.create(amount=500, operation_id="crash-after-dispatch")
+
+        op = self.journal.get("crash-after-dispatch")
+        self.assertEqual(op.state, EffectState.DISPATCHING)
+        self.assertIsNotNone(op.dispatch_started_at)
+        self.assertEqual(self.gateway.create_calls, 1)
+
+        # Simulate process downtime beyond the configured provider retention window.
+        self.journal.db.execute(
+            "UPDATE operations SET dispatch_started_at=? WHERE operation_id=?",
+            (time.time() - 86401, "crash-after-dispatch"),
+        )
+        self.journal.db.commit()
+        self.journal.db.close()
+        self.journal = OperationJournal(self.tmp.name)
+        self.boundary = PaymentIntentBoundary(
+            self.journal, self.gateway, idempotency_window_seconds=86400,
+        )
+
+        recovered = self.boundary.create(amount=500, operation_id="crash-after-dispatch")
+        self.assertEqual(recovered.state, EffectState.UNKNOWN)
+        self.assertEqual(self.gateway.create_calls, 1)
+        self.assertEqual(len(self.gateway.intents), 1)
+        last_evidence = self.journal.db.execute(
+            "SELECT lookup_method FROM evidence WHERE operation_id=? ORDER BY evidence_id DESC LIMIT 1",
+            ("crash-after-dispatch",),
+        ).fetchone()[0]
+        self.assertEqual(last_evidence, "retry_refused_window_expired")
+
+    def test_upgrade_fences_legacy_pending_rows_as_ambiguous(self):
+        legacy_file = tempfile.NamedTemporaryFile(delete=False)
+        legacy_file.close()
+        try:
+            db = sqlite3.connect(legacy_file.name)
+            db.executescript("""
+            CREATE TABLE operations (
+              operation_id TEXT PRIMARY KEY, payload_digest TEXT NOT NULL,
+              amount INTEGER NOT NULL, currency TEXT NOT NULL, state TEXT NOT NULL,
+              idempotency_key TEXT NOT NULL UNIQUE, provider_reference TEXT,
+              created_at REAL NOT NULL
+            );
+            CREATE TABLE evidence (
+              evidence_id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL,
+              observed_at REAL NOT NULL, lookup_method TEXT NOT NULL,
+              authority TEXT NOT NULL, provider_reference TEXT, state TEXT NOT NULL,
+              raw_json TEXT NOT NULL
+            );
+            INSERT INTO operations VALUES
+              ('legacy-pending', 'digest', 500, 'usd', 'PENDING', 'legacy-key', NULL, 1.0);
+            """)
+            db.commit()
+            db.close()
+
+            legacy_journal = OperationJournal(legacy_file.name)
+            legacy_op = legacy_journal.get("legacy-pending")
+            self.assertEqual(legacy_op.state, EffectState.UNKNOWN)
+            self.assertEqual(legacy_op.dispatch_started_at, 1.0)
+            legacy_gateway = FakeStripeTestMode()
+            legacy_boundary = PaymentIntentBoundary(legacy_journal, legacy_gateway)
+            self.assertEqual(legacy_boundary.recover("legacy-pending").state, EffectState.UNKNOWN)
+            self.assertEqual(legacy_gateway.create_calls, 0)
+            legacy_journal.db.close()
+        finally:
+            os.unlink(legacy_file.name)
+
     def test_custom_tool_exposes_claim_safe_result(self):
         tool = CrewAIPaymentIntentTool(self.boundary)
         self.gateway.lose_next_create_response = True
