@@ -1,0 +1,2 @@
+# Only for optional live Stripe test-mode adapter
+stripe>=12
