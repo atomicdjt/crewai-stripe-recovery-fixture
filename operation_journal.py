@@ -104,8 +104,9 @@ class OperationJournal:
         if "dispatch_owner_token" not in columns:
             self.db.execute("ALTER TABLE operations ADD COLUMN dispatch_owner_token TEXT")
             self.db.execute(
-                "UPDATE operations SET state=? WHERE state=?",
-                (EffectState.UNKNOWN.value, EffectState.DISPATCHING.value),
+                "UPDATE operations SET state=?, dispatch_owner_token=? WHERE state=?",
+                (EffectState.UNKNOWN.value, "legacy-unfenced",
+                 EffectState.DISPATCHING.value),
             )
             legacy_unfenced = True
         else:
@@ -121,8 +122,8 @@ class OperationJournal:
             # authoritative lookup or explicit operator reconciliation is needed.
             self.db.execute(
                 "UPDATE operations SET dispatch_lease_expires_at=? "
-                "WHERE state=? AND dispatch_started_at IS NOT NULL",
-                (1e30, EffectState.UNKNOWN.value),
+                "WHERE dispatch_owner_token=?",
+                (1e30, "legacy-unfenced"),
             )
         # Preserve compatibility with journals written before the resource-
         # creation state was renamed to avoid implying payment completion.
