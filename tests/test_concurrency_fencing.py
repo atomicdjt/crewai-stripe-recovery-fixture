@@ -200,6 +200,15 @@ class ConcurrentRecoveryFencingTests(unittest.TestCase):
               'old-key', NULL, 0, 1
             );
             """)
+            now = time.time()
+            db.execute(
+                "UPDATE operations SET created_at=?, dispatch_started_at=? "
+                "WHERE operation_id='ownerless'", (now, now))
+            db.execute(
+                "INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("legacy-unknown", "old-digest", 500, "usd", "UNKNOWN",
+                 "unknown-key", None, now, now))
+            db.commit()
             db.close()
             journal = OperationJournal(path)
             gateway = FakeStripeTestMode()
@@ -213,6 +222,14 @@ class ConcurrentRecoveryFencingTests(unittest.TestCase):
                 self.assertEqual(PaymentIntentBoundary(journal, gateway).recover(
                     "ownerless").state, EffectState.UNKNOWN)
                 self.assertEqual(gateway.create_calls, 0)
+                # The migration must not quarantine unrelated old UNKNOWN rows.
+                self.assertIsNone(journal.db.execute(
+                    "SELECT dispatch_lease_expires_at FROM operations "
+                    "WHERE operation_id='legacy-unknown'").fetchone()[0])
+                recovered = PaymentIntentBoundary(journal, gateway).recover(
+                    "legacy-unknown")
+                self.assertEqual(recovered.state, EffectState.INTENT_CREATED)
+                self.assertEqual(gateway.create_calls, 1)
             finally:
                 journal.db.close()
 
