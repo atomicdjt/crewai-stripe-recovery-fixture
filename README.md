@@ -17,6 +17,7 @@ It accompanies the discussion in [CrewAI issue #6414](https://github.com/crewAII
 - The custom tool reports `payment_confirmation_attempted: false`; it does not claim that a payment completed.
 - A SQLite conditional claim under `BEGIN IMMEDIATE` assigns a unique owner token and increasing dispatch generation. While its lease is valid, a second recovery worker does not issue another retry for the same operation.
 - Recovery rechecks both lease ownership and the original idempotency window inside the claim transaction. Stale attempts cannot release a newer dispatch owner's lease.
+- If another worker observes the original key window has expired, its refusal is appended as evidence without hiding a still-live `DISPATCHING` owner. Once that lease expires, a subsequent refusal can project `UNKNOWN` and clear the expired owner atomically, but it never authorizes a new provider request.
 - A late ambiguous `UNKNOWN` observation remains in append-only evidence but cannot overwrite a trusted `INTENT_CREATED` projection. Conflicting trusted provider references likewise require review instead of silent replacement.
 - Existing `DISPATCHING` rows from the pre-ownership schema are quarantined on upgrade because their in-flight status cannot be established safely; unrelated legacy `UNKNOWN` rows remain eligible for the usual window-gated recovery.
 
