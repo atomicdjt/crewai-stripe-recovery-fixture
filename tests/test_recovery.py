@@ -27,11 +27,25 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(len(self.gateway.intents), 1)
     def test_provider_reference_lookup_recovers_after_restart(self):
         op = self.boundary.create(amount=500, operation_id="lookup")
-        self.journal.observe("lookup", state=EffectState.UNKNOWN, lookup_method="crash_after_reference", authority="application", provider_reference=op.provider_reference, raw={})
+        # Seed a legacy ambiguous snapshot with an already trusted reference,
+        # rather than asking the new monotonic API to demote INTENT_CREATED.
+        self.journal.db.execute(
+            "UPDATE operations SET state=? WHERE operation_id=?",
+            (EffectState.UNKNOWN.value, op.operation_id),
+        )
+        self.journal.db.commit()
+        self.journal.db.close()
+        self.journal = OperationJournal(self.tmp.name)
+        self.boundary = PaymentIntentBoundary(self.journal, self.gateway)
         self.assertEqual(self.boundary.recover("lookup").state, EffectState.INTENT_CREATED)
     def test_ambiguous_retrieval_remains_unknown(self):
         op = self.boundary.create(amount=500, operation_id="ambiguous")
-        self.journal.observe("ambiguous", state=EffectState.UNKNOWN, lookup_method="lost", authority="application", provider_reference=op.provider_reference, raw={})
+        # Recreate a legacy UNKNOWN snapshot carrying a trusted reference.
+        self.journal.db.execute(
+            "UPDATE operations SET state=? WHERE operation_id=?",
+            (EffectState.UNKNOWN.value, op.operation_id),
+        )
+        self.journal.db.commit()
         self.gateway.fail_next_retrieve = True
         self.assertEqual(self.boundary.recover("ambiguous").state, EffectState.UNKNOWN)
     def test_mismatched_provider_evidence_cannot_commit(self):
