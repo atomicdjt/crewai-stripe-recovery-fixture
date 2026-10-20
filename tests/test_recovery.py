@@ -97,8 +97,11 @@ class RecoveryTests(unittest.TestCase):
 
         # Simulate process downtime beyond the configured provider retention window.
         self.journal.db.execute(
-            "UPDATE operations SET dispatch_started_at=? WHERE operation_id=?",
-            (time.time() - 86401, "crash-after-dispatch"),
+            "UPDATE operations SET dispatch_started_at=?, "
+            "dispatch_lease_expires_at=? WHERE operation_id=?",
+            # A real 86,401-second restart delay also expires the 60-second
+            # dispatch lease. Both clocks must advance in this simulation.
+            (time.time() - 86401, time.time() - 86401, "crash-after-dispatch"),
         )
         self.journal.db.commit()
         self.journal.db.close()
