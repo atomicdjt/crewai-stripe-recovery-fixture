@@ -270,13 +270,22 @@ class OperationJournal:
                 )
             elif state is EffectState.UNKNOWN:
                 if lookup_method == "retry_refused_window_expired" and owner_token is None:
-                    # The original key window is gone. Record uncertainty
-                    # without releasing a possibly still-active dispatch owner.
+                    # A key-window refusal is an unowned observation. Keep the
+                    # active dispatch projection while a different worker still
+                    # owns a *live* lease; its outcome may arrive later.
+                    # After the lease expires, persist UNKNOWN and clear the
+                    # obsolete owner atomically. This is NOT evidence of
+                    # NOT_COMMITTED and never authorizes a post-window retry.
+                    now = time.time()
                     self.db.execute(
-                        "UPDATE operations SET state=? WHERE operation_id=? "
-                        "AND state NOT IN (?, ?)",
+                        "UPDATE operations SET state=?, dispatch_owner_token=NULL, "
+                        "dispatch_lease_expires_at=NULL WHERE operation_id=? "
+                        "AND state NOT IN (?, ?) "
+                        "AND (dispatch_owner_token IS NULL OR "
+                        "(dispatch_lease_expires_at IS NOT NULL "
+                        "AND dispatch_lease_expires_at<=?))",
                         (state.value, operation_id, EffectState.INTENT_CREATED.value,
-                         EffectState.NOT_COMMITTED.value),
+                         EffectState.NOT_COMMITTED.value, now),
                     )
                 else:
                     # An attempt may release only its own lease. An unowned
