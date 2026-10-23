@@ -78,7 +78,9 @@ class OperationJournal:
           operation_id TEXT PRIMARY KEY, payload_digest TEXT NOT NULL,
           amount INTEGER NOT NULL, currency TEXT NOT NULL, state TEXT NOT NULL,
           idempotency_key TEXT NOT NULL UNIQUE, provider_reference TEXT,
-          created_at REAL NOT NULL, dispatch_started_at REAL
+          created_at REAL NOT NULL, dispatch_started_at REAL,
+          dispatch_owner_token TEXT, dispatch_generation INTEGER NOT NULL DEFAULT 0,
+          dispatch_lease_expires_at REAL
         );
         CREATE TABLE IF NOT EXISTS evidence (
           evidence_id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL,
@@ -96,6 +98,32 @@ class OperationJournal:
             self.db.execute(
                 "UPDATE operations SET state=?, dispatch_started_at=created_at WHERE state=?",
                 (EffectState.UNKNOWN.value, EffectState.PENDING.value),
+            )
+        # Existing in-flight rows have no owner/fencing provenance. Quarantine
+        # them rather than treating an unknown predecessor as a free retry slot.
+        if "dispatch_owner_token" not in columns:
+            self.db.execute("ALTER TABLE operations ADD COLUMN dispatch_owner_token TEXT")
+            self.db.execute(
+                "UPDATE operations SET state=?, dispatch_owner_token=? WHERE state=?",
+                (EffectState.UNKNOWN.value, "legacy-unfenced",
+                 EffectState.DISPATCHING.value),
+            )
+            legacy_unfenced = True
+        else:
+            legacy_unfenced = False
+        if "dispatch_generation" not in columns:
+            self.db.execute(
+                "ALTER TABLE operations ADD COLUMN dispatch_generation INTEGER NOT NULL DEFAULT 0"
+            )
+        if "dispatch_lease_expires_at" not in columns:
+            self.db.execute("ALTER TABLE operations ADD COLUMN dispatch_lease_expires_at REAL")
+        if legacy_unfenced:
+            # No automatic retry for pre-owner in-flight operations. A positive
+            # authoritative lookup or explicit operator reconciliation is needed.
+            self.db.execute(
+                "UPDATE operations SET dispatch_lease_expires_at=? "
+                "WHERE dispatch_owner_token=?",
+                (1e30, "legacy-unfenced"),
             )
         # Preserve compatibility with journals written before the resource-
         # creation state was renamed to avoid implying payment completion.
@@ -126,48 +154,74 @@ class OperationJournal:
             raise KeyError(operation_id)
         return self._operation(row)
 
-    def begin_dispatch(self, operation_id: str) -> bool:
-        """Durably fence a first provider call before crossing the boundary."""
-        now = time.time()
+    def begin_dispatch(self, operation_id: str, *, lease_seconds: float = 60.0) -> str | None:
+        """Atomically claim first dispatch; return a unique fencing token."""
+        token = uuid.uuid4().hex
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            now = time.time()
             cursor = self.db.execute(
-                "UPDATE operations SET state=?, dispatch_started_at=? "
+                "UPDATE operations SET state=?, dispatch_started_at=?, "
+                "dispatch_owner_token=?, dispatch_lease_expires_at=?, "
+                "dispatch_generation=dispatch_generation+1 "
                 "WHERE operation_id=? AND state=?",
-                (EffectState.DISPATCHING.value, now, operation_id, EffectState.PENDING.value),
+                (EffectState.DISPATCHING.value, now, token, now + lease_seconds,
+                 operation_id, EffectState.PENDING.value),
             )
             if cursor.rowcount != 1:
                 self.db.rollback()
-                return False
+                return None
             op = self.get(operation_id)
             self._append_evidence(operation_id, observed_at=now,
                 lookup_method="dispatch_started", authority="application",
                 provider_reference=None, state=EffectState.DISPATCHING,
-                raw={"idempotency_key": op.idempotency_key, "attempt": "initial"})
+                raw={"idempotency_key": op.idempotency_key, "attempt": "initial",
+                     "generation": 1, "owner_token": token})
             self.db.commit()
-            return True
+            return token
         except BaseException:
             self.db.rollback()
             raise
 
-    def record_retry_dispatch(self, operation_id: str) -> None:
-        """Persist an in-window retry attempt without resetting the first-use clock."""
-        now = time.time()
+    def claim_retry_dispatch(self, operation_id: str, *,
+                             idempotency_window_seconds: float,
+                             lease_seconds: float = 60.0) -> str | None:
+        """One journal owner per retry generation, with age checked atomically.
+
+        Lease expiration permits crash recovery but does NOT prove that the
+        previous HTTP call has stopped. The provider idempotency key is still
+        essential; no exactly-once network-call claim is made.
+        """
+        token = uuid.uuid4().hex
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            row = self.db.execute(
-                "SELECT idempotency_key FROM operations WHERE operation_id=?",
+            now = time.time()
+            cursor = self.db.execute(
+                "UPDATE operations SET state=?, dispatch_owner_token=?, "
+                "dispatch_lease_expires_at=?, dispatch_generation=dispatch_generation+1 "
+                "WHERE operation_id=? AND state IN (?, ?) "
+                "AND dispatch_started_at IS NOT NULL "
+                "AND dispatch_started_at<=? AND dispatch_started_at>? "
+                "AND (dispatch_lease_expires_at IS NULL OR dispatch_lease_expires_at<=?)",
+                (EffectState.DISPATCHING.value, token, now + lease_seconds,
+                 operation_id, EffectState.UNKNOWN.value, EffectState.DISPATCHING.value,
+                 now, now - idempotency_window_seconds, now),
+            )
+            if cursor.rowcount != 1:
+                self.db.rollback()
+                return None
+            op = self.get(operation_id)
+            generation = self.db.execute(
+                "SELECT dispatch_generation FROM operations WHERE operation_id=?",
                 (operation_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(operation_id)
-            self.db.execute("UPDATE operations SET state=? WHERE operation_id=?",
-                            (EffectState.DISPATCHING.value, operation_id))
+            ).fetchone()[0]
             self._append_evidence(operation_id, observed_at=now,
                 lookup_method="retry_dispatch_started", authority="application",
                 provider_reference=None, state=EffectState.DISPATCHING,
-                raw={"idempotency_key": row["idempotency_key"], "attempt": "retry"})
+                raw={"idempotency_key": op.idempotency_key, "attempt": "retry",
+                     "generation": generation, "owner_token": token})
             self.db.commit()
+            return token
         except BaseException:
             self.db.rollback()
             raise
@@ -184,20 +238,86 @@ class OperationJournal:
 
     def observe(self, operation_id: str, *, state: EffectState, lookup_method: str,
                 authority: str, provider_reference: str | None, raw: Mapping[str, Any],
-                promote_provider_reference: bool = False) -> Operation:
+                promote_provider_reference: bool = False,
+                owner_token: str | None = None) -> Operation:
+        """Append evidence and apply only a monotonic, owner-safe projection.
+
+        Stale UNKNOWN results remain in the evidence log but may not demote
+        INTENT_CREATED or overwrite a newer dispatch owner's projection.
+        """
         if authority not in {"provider", "application"}:
             raise ValueError("authority must be provider or application")
-        self._append_evidence(operation_id, observed_at=time.time(),
-            lookup_method=lookup_method, authority=authority,
-            provider_reference=provider_reference, state=state, raw=raw)
-        # Evidence may contain a candidate provider ID even when it fails
-        # correlation. Only explicitly correlated provider evidence can make
-        # an ID a trusted future retrieval target.
-        trusted_reference = provider_reference if promote_provider_reference else None
-        self.db.execute("UPDATE operations SET state=?, provider_reference=COALESCE(?, provider_reference) WHERE operation_id=?",
-                        (state.value, trusted_reference, operation_id))
-        self.db.commit()
-        return self.get(operation_id)
+        if state is EffectState.INTENT_CREATED and (
+            authority != "provider" or not promote_provider_reference or not provider_reference
+        ):
+            raise ValueError("INTENT_CREATED requires correlated provider evidence")
+        if state is EffectState.NOT_COMMITTED:
+            raise ValueError(
+                "NOT_COMMITTED requires an explicit provider-authoritative proof path"
+            )
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self._append_evidence(operation_id, observed_at=time.time(),
+                lookup_method=lookup_method, authority=authority,
+                provider_reference=provider_reference, state=state, raw=raw)
+            if state is EffectState.INTENT_CREATED:
+                # A verified positive can arrive after an old lease expires;
+                # preserve it even if the worker is no longer the active owner.
+                # Conflicting positive references require manual review.
+                self.db.execute(
+                    "UPDATE operations SET state=?, provider_reference=?, "
+                    "dispatch_owner_token=NULL, dispatch_lease_expires_at=NULL "
+                    "WHERE operation_id=? AND state!=? "
+                    "AND (provider_reference IS NULL OR provider_reference=?)",
+                    (state.value, provider_reference, operation_id,
+                     EffectState.NOT_COMMITTED.value, provider_reference),
+                )
+            elif state is EffectState.UNKNOWN:
+                if lookup_method == "retry_refused_window_expired" and owner_token is None:
+                    # A key-window refusal is an unowned observation. Keep the
+                    # active dispatch projection while a different worker still
+                    # owns a *live* lease; its outcome may arrive later.
+                    # After the lease expires, persist UNKNOWN and clear the
+                    # obsolete owner atomically. This is NOT evidence of
+                    # NOT_COMMITTED and never authorizes a post-window retry.
+                    now = time.time()
+                    self.db.execute(
+                        "UPDATE operations SET state=?, dispatch_owner_token=NULL, "
+                        "dispatch_lease_expires_at=NULL WHERE operation_id=? "
+                        "AND state NOT IN (?, ?) "
+                        "AND (dispatch_owner_token IS NULL OR "
+                        "(dispatch_lease_expires_at IS NOT NULL "
+                        "AND dispatch_lease_expires_at<=?))",
+                        (state.value, operation_id, EffectState.INTENT_CREATED.value,
+                         EffectState.NOT_COMMITTED.value, now),
+                    )
+                else:
+                    # An attempt may release only its own lease. An unowned
+                    # lookup may alter only an unowned operation.
+                    predicate = ("dispatch_owner_token IS NULL" if owner_token is None
+                                 else "dispatch_owner_token=?")
+                    params = [state.value, operation_id,
+                              EffectState.INTENT_CREATED.value, EffectState.NOT_COMMITTED.value]
+                    if owner_token is not None:
+                        params.append(owner_token)
+                    self.db.execute(
+                        "UPDATE operations SET state=?, dispatch_owner_token=NULL, "
+                        "dispatch_lease_expires_at=NULL WHERE operation_id=? "
+                        "AND state NOT IN (?, ?) AND " + predicate, params,
+                    )
+            else:
+                # Nonterminal observations never demote a verified result.
+                self.db.execute(
+                    "UPDATE operations SET state=? WHERE operation_id=? "
+                    "AND state NOT IN (?, ?)",
+                    (state.value, operation_id, EffectState.INTENT_CREATED.value,
+                     EffectState.NOT_COMMITTED.value),
+                )
+            self.db.commit()
+            return self.get(operation_id)
+        except BaseException:
+            self.db.rollback()
+            raise
 
     @staticmethod
     def _operation(row: sqlite3.Row) -> Operation:
@@ -208,9 +328,12 @@ class OperationJournal:
 
 class PaymentIntentBoundary:
     """Provider boundary usable directly or through a CrewAI custom tool wrapper."""
-    def __init__(self, journal: OperationJournal, gateway: PaymentGateway, *, idempotency_window_seconds: int = 86400) -> None:
+    def __init__(self, journal: OperationJournal, gateway: PaymentGateway, *,
+                 idempotency_window_seconds: int = 86400,
+                 dispatch_lease_seconds: float = 60.0) -> None:
         self.journal, self.gateway = journal, gateway
         self.idempotency_window_seconds = idempotency_window_seconds
+        self.dispatch_lease_seconds = dispatch_lease_seconds
 
     def create(self, *, amount: int, currency: str = "usd", operation_id: str | None = None) -> Operation:
         op = self.journal.begin(amount=amount, currency=currency, operation_id=operation_id)
@@ -218,7 +341,9 @@ class PaymentIntentBoundary:
             return op
         if op.state in {EffectState.UNKNOWN, EffectState.DISPATCHING}:
             return self.recover(op.operation_id)
-        if not self.journal.begin_dispatch(op.operation_id):
+        token = self.journal.begin_dispatch(
+            op.operation_id, lease_seconds=self.dispatch_lease_seconds)
+        if token is None:
             # Another caller already owns the first dispatch or has advanced
             # the operation. Return its durable projection without sending a
             # second request from this invocation.
@@ -230,8 +355,8 @@ class PaymentIntentBoundary:
         except LostResponse as exc:
             return self.journal.observe(op.operation_id, state=EffectState.UNKNOWN,
                 lookup_method="create_response_lost", authority="application", provider_reference=None,
-                raw={"error": str(exc)})
-        return self._record_provider_response(op, response, "create")
+                raw={"error": str(exc)}, owner_token=token)
+        return self._record_provider_response(op, response, "create", owner_token=token)
 
     def recover(self, operation_id: str) -> Operation:
         op = self.journal.get(operation_id)
@@ -258,26 +383,43 @@ class PaymentIntentBoundary:
                 raw={"window_seconds": self.idempotency_window_seconds,
                      "dispatch_age_seconds": age,
                      "reason": "missing_or_expired_dispatch_timestamp"})
-        self.journal.record_retry_dispatch(op.operation_id)
+        token = self.journal.claim_retry_dispatch(
+            op.operation_id, idempotency_window_seconds=self.idempotency_window_seconds,
+            lease_seconds=self.dispatch_lease_seconds)
+        if token is None:
+            # A different worker owns the attempt, positive evidence has
+            # arrived, or the original provider idempotency window has closed.
+            return self.journal.get(op.operation_id)
         try:
             response = self.gateway.create_payment_intent(amount=op.amount, currency=op.currency,
                 idempotency_key=op.idempotency_key, metadata={"operation_id": op.operation_id})
         except LostResponse as exc:
             return self.journal.observe(op.operation_id, state=EffectState.UNKNOWN, lookup_method="retry_response_lost",
-                authority="application", provider_reference=None, raw={"error": str(exc)})
-        return self._record_provider_response(op, response, "idempotent_retry")
+                authority="application", provider_reference=None, raw={"error": str(exc)},
+                owner_token=token)
+        return self._record_provider_response(op, response, "idempotent_retry", owner_token=token)
 
-    def _record_provider_response(self, op: Operation, response: Mapping[str, Any], lookup_method: str) -> Operation:
+    def _record_provider_response(self, op: Operation, response: Mapping[str, Any],
+                                  lookup_method: str, owner_token: str | None = None) -> Operation:
         reference = response.get("id")
-        metadata = response.get("metadata", {})
-        same_operation = metadata.get("operation_id") == op.operation_id
-        same_amount = response.get("amount") == op.amount and response.get("currency", "").lower() == op.currency
-        if not (reference and same_operation and same_amount):
+        metadata = response.get("metadata")
+        currency = response.get("currency")
+        valid_reference = isinstance(reference, str) and bool(reference.strip())
+        same_operation = (
+            isinstance(metadata, Mapping)
+            and metadata.get("operation_id") == op.operation_id
+        )
+        same_amount = (
+            response.get("amount") == op.amount
+            and isinstance(currency, str)
+            and currency.lower() == op.currency
+        )
+        if not (valid_reference and same_operation and same_amount):
             return self.journal.observe(op.operation_id, state=EffectState.UNKNOWN, lookup_method=lookup_method,
-                authority="provider", provider_reference=str(reference) if reference else None,
-                raw=dict(response))
+                authority="provider", provider_reference=reference if valid_reference else None,
+                raw=dict(response), owner_token=owner_token)
         return self.journal.observe(op.operation_id, state=EffectState.INTENT_CREATED, lookup_method=lookup_method,
-            authority="provider", provider_reference=str(reference), raw=dict(response),
+            authority="provider", provider_reference=reference, raw=dict(response),
             promote_provider_reference=True)
 
 
