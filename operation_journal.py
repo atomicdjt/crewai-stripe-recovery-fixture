@@ -2,8 +2,8 @@
 
 The important property is epistemic, not merely mechanical: ambiguous provider
 outcomes remain UNKNOWN until backed by provider evidence.  This module is
-dependency-free; production callers can use StripeGateway below or supply an
-adapter with the same two methods.
+dependency-free; production callers can import StripeGateway from
+`stripe_gateway.py` or supply an adapter with the same two methods.
 """
 from __future__ import annotations
 

@@ -1,0 +1,37 @@
+name: live Stripe test-mode smoke
+
+on:
+  push:
+    branches: ["test/live-stripe-provider"]
+    paths:
+      - "operation_journal.py"
+      - "stripe_gateway.py"
+      - "live_stripe_smoke.py"
+      - "requirements-live.txt"
+      - ".github/workflows/live-stripe-smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stripe-test-mode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      STRIPE_TEST_SECRET_KEY: ${{ secrets.STRIPE_TEST_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run controlled live-provider test when credential is configured
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${STRIPE_TEST_SECRET_KEY:-}" ]; then
+            echo "LIVE_STRIPE_RESULT=SKIPPED_NO_STRIPE_TEST_SECRET_KEY"
+            exit 0
+          fi
+          python -m pip install --disable-pip-version-check -r requirements-live.txt
+          python live_stripe_smoke.py

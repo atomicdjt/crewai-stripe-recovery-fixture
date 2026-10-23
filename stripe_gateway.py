@@ -8,10 +8,16 @@ class StripeGateway:
         if not secret_key.startswith("sk_test_"):
             raise ValueError("Only an sk_test_ key is accepted by this reference adapter")
         import stripe  # optional dependency
-        self.stripe = stripe.StripeClient(secret_key)
+        # Keep transport retries observable at the fixture boundary. Stripe's
+        # SDK can retry transient failures automatically, but that would blur
+        # this harness's attempt/ownership evidence.
+        self.stripe = stripe.StripeClient(secret_key, max_network_retries=0)
     def create_payment_intent(self, *, amount: int, currency: str, idempotency_key: str, metadata: Mapping[str, str]) -> Mapping[str, Any]:
         try:
-            item = self.stripe.v1.payment_intents.create({"amount": amount, "currency": currency, "metadata": dict(metadata)}, {"idempotency_key": idempotency_key})
+            item = self.stripe.v1.payment_intents.create(
+                {"amount": amount, "currency": currency, "metadata": dict(metadata)},
+                options={"idempotency_key": idempotency_key},
+            )
             return dict(item)
         except Exception as exc:
             # Network uncertainty is deliberately represented as unknown, never non-commit.
