@@ -251,6 +251,10 @@ class OperationJournal:
             authority != "provider" or not promote_provider_reference or not provider_reference
         ):
             raise ValueError("INTENT_CREATED requires correlated provider evidence")
+        if state is EffectState.NOT_COMMITTED:
+            raise ValueError(
+                "NOT_COMMITTED requires an explicit provider-authoritative proof path"
+            )
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self._append_evidence(operation_id, observed_at=time.time(),
@@ -398,15 +402,24 @@ class PaymentIntentBoundary:
     def _record_provider_response(self, op: Operation, response: Mapping[str, Any],
                                   lookup_method: str, owner_token: str | None = None) -> Operation:
         reference = response.get("id")
-        metadata = response.get("metadata", {})
-        same_operation = metadata.get("operation_id") == op.operation_id
-        same_amount = response.get("amount") == op.amount and response.get("currency", "").lower() == op.currency
-        if not (reference and same_operation and same_amount):
+        metadata = response.get("metadata")
+        currency = response.get("currency")
+        valid_reference = isinstance(reference, str) and bool(reference.strip())
+        same_operation = (
+            isinstance(metadata, Mapping)
+            and metadata.get("operation_id") == op.operation_id
+        )
+        same_amount = (
+            response.get("amount") == op.amount
+            and isinstance(currency, str)
+            and currency.lower() == op.currency
+        )
+        if not (valid_reference and same_operation and same_amount):
             return self.journal.observe(op.operation_id, state=EffectState.UNKNOWN, lookup_method=lookup_method,
-                authority="provider", provider_reference=str(reference) if reference else None,
+                authority="provider", provider_reference=reference if valid_reference else None,
                 raw=dict(response), owner_token=owner_token)
         return self.journal.observe(op.operation_id, state=EffectState.INTENT_CREATED, lookup_method=lookup_method,
-            authority="provider", provider_reference=str(reference), raw=dict(response),
+            authority="provider", provider_reference=reference, raw=dict(response),
             promote_provider_reference=True)
 
 
