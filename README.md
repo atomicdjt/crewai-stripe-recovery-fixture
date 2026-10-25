@@ -41,9 +41,13 @@ python -m unittest discover -s tests -v
 
 ## Optional live Stripe test-mode smoke test
 
-Install `stripe`, export an `sk_test_...` key as `STRIPE_TEST_SECRET_KEY`, then instantiate `StripeGateway`. Never place the key in this repository. A live test should create only an unconfirmed test-mode PaymentIntent and must explicitly record the result as provider evidence. This reference intentionally does not automatically issue live financial-provider calls.
+The repository now includes `live_stripe_smoke.py` and a credential-gated GitHub Actions workflow. The live harness pins `stripe==16.0.0`, accepts only an `sk_test_...` secret from `STRIPE_TEST_SECRET_KEY`, and creates an **unconfirmed test-mode PaymentIntent only**. It does not attach a payment method, confirm, capture, or create a live-mode charge.
 
-Before interpreting a retry as safe, verify Stripe's current documented idempotency semantics and retention period. Beyond that retention period, this fixture refuses a blind re-create and preserves `UNKNOWN`.
+The controlled fault model is a process loss after Stripe returns the first create response but before the local journal records it. On restart, the fixture reuses the same durable operation/idempotency key and requires the provider to resolve the retry to the same PaymentIntent. It then retrieves that PaymentIntent and verifies amount, currency, operation metadata, and `livemode=false`.
+
+The first workflow execution on branch `test/live-stripe-provider` completed with `LIVE_STRIPE_RESULT=SKIPPED_NO_STRIPE_TEST_SECRET_KEY`; therefore **no live Stripe provider result has yet been observed or claimed**.
+
+Stripe's API v1 documentation says that after endpoint execution begins, Stripe stores the first response for an idempotency key and returns that result on retries; keys may be pruned after they are at least 24 hours old. This fixture conservatively refuses blind create retries beyond its configured first-dispatch window rather than treating an expired key as proof of non-commit.
 
 ## Integration note
 
