@@ -38,7 +38,87 @@ class BlockingRetryGateway:
         return None
 
 
+class _ReadRaceCursor:
+    def __init__(self, cursor, connection, barrier, state):
+        self._cursor = cursor
+        self._connection = connection
+        self._barrier = barrier
+        self._state = state
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        if row is None and not self._connection.in_transaction and not self._state["waited"]:
+            self._state["waited"] = True
+            self._barrier.wait(timeout=5)
+        return row
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _ReadRaceConnection:
+    """Hold an unprotected first-use lookup until both callers have read."""
+    def __init__(self, connection, barrier):
+        self._connection = connection
+        self._barrier = barrier
+        self._state = {"waited": False}
+
+    def execute(self, sql, parameters=()):
+        cursor = self._connection.execute(sql, parameters)
+        if sql.startswith("SELECT * FROM operations WHERE operation_id=?"):
+            return _ReadRaceCursor(cursor, self._connection, self._barrier, self._state)
+        return cursor
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 class ConcurrentRecoveryFencingTests(unittest.TestCase):
+    def test_concurrent_first_use_of_same_operation_id_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.sqlite3"
+            seed = OperationJournal(path)
+            seed.db.close()
+            lookup_barrier = threading.Barrier(2)
+            init_lock = threading.Lock()
+            results, errors = [], []
+
+            def worker():
+                journal = None
+                try:
+                    # Keep schema initialization out of the race under test.
+                    with init_lock:
+                        journal = OperationJournal(path)
+                    journal.db = _ReadRaceConnection(journal.db, lookup_barrier)
+                    results.append(journal.begin(
+                        amount=500, currency="usd", operation_id="same-first-use"
+                    ))
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    if journal is not None:
+                        journal.db.close()
+
+            callers = [threading.Thread(target=worker) for _ in range(2)]
+            for caller in callers:
+                caller.start()
+            for caller in callers:
+                caller.join(timeout=7)
+
+            self.assertFalse(any(caller.is_alive() for caller in callers))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0].operation_id, results[1].operation_id)
+            self.assertEqual(results[0].idempotency_key, results[1].idempotency_key)
+            verify = OperationJournal(path)
+            try:
+                self.assertEqual(verify.db.execute(
+                    "SELECT COUNT(*) FROM operations WHERE operation_id=?",
+                    ("same-first-use",),
+                ).fetchone()[0], 1)
+            finally:
+                verify.db.close()
+
     def test_second_worker_does_not_dispatch_during_active_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "journal.sqlite3"

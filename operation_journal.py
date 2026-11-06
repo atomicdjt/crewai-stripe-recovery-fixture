@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import time
 import uuid
@@ -61,6 +62,16 @@ def _canonical_digest(amount: int, currency: str) -> str:
 
 def _idempotency_key(operation_id: str) -> str:
     return "crewai-op-" + hashlib.sha256(operation_id.encode()).hexdigest()[:48]
+
+
+def _validate_nonnegative_seconds(value: float, name: str) -> None:
+    try:
+        valid = (not isinstance(value, bool) and isinstance(value, (int, float))
+                 and value >= 0 and math.isfinite(value))
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError(f"{name} must be finite and nonnegative")
 
 
 class OperationJournal:
@@ -132,21 +143,34 @@ class OperationJournal:
         self.db.commit()
 
     def begin(self, *, amount: int, currency: str, operation_id: str | None = None) -> Operation:
-        if amount <= 0:
-            raise ValueError("amount must be positive")
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            raise ValueError("amount must be a positive integer")
         operation_id = operation_id or str(uuid.uuid4())
         digest = _canonical_digest(amount, currency)
-        old = self.db.execute("SELECT * FROM operations WHERE operation_id=?", (operation_id,)).fetchone()
-        if old:
-            if old["payload_digest"] != digest:
-                raise ValueError("operation_id cannot be reused with a different payload")
-            return self._operation(old)
-        now = time.time()
-        self.db.execute("INSERT INTO operations (operation_id, payload_digest, amount, currency, state, idempotency_key, provider_reference, created_at, dispatch_started_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL)",
-                        (operation_id, digest, amount, currency.lower(), EffectState.PENDING.value,
-                         _idempotency_key(operation_id), now))
-        self.db.commit()
-        return self.get(operation_id)
+        # Serialize lookup plus insert so concurrent first uses of one
+        # operation_id converge on the same durable intent instead of racing
+        # into the idempotency_key uniqueness constraint.
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            old = self.db.execute(
+                "SELECT * FROM operations WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            if old:
+                if old["payload_digest"] != digest:
+                    raise ValueError("operation_id cannot be reused with a different payload")
+                self.db.commit()
+                return self._operation(old)
+            now = time.time()
+            self.db.execute(
+                "INSERT INTO operations (operation_id, payload_digest, amount, currency, state, idempotency_key, provider_reference, created_at, dispatch_started_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL)",
+                (operation_id, digest, amount, currency.lower(), EffectState.PENDING.value,
+                 _idempotency_key(operation_id), now),
+            )
+            self.db.commit()
+            return self.get(operation_id)
+        except BaseException:
+            self.db.rollback()
+            raise
 
     def get(self, operation_id: str) -> Operation:
         row = self.db.execute("SELECT * FROM operations WHERE operation_id=?", (operation_id,)).fetchone()
@@ -156,6 +180,7 @@ class OperationJournal:
 
     def begin_dispatch(self, operation_id: str, *, lease_seconds: float = 60.0) -> str | None:
         """Atomically claim first dispatch; return a unique fencing token."""
+        _validate_nonnegative_seconds(lease_seconds, "lease_seconds")
         token = uuid.uuid4().hex
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -192,6 +217,9 @@ class OperationJournal:
         previous HTTP call has stopped. The provider idempotency key is still
         essential; no exactly-once network-call claim is made.
         """
+        _validate_nonnegative_seconds(idempotency_window_seconds,
+                                      "idempotency_window_seconds")
+        _validate_nonnegative_seconds(lease_seconds, "lease_seconds")
         token = uuid.uuid4().hex
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -331,6 +359,10 @@ class PaymentIntentBoundary:
     def __init__(self, journal: OperationJournal, gateway: PaymentGateway, *,
                  idempotency_window_seconds: int = 86400,
                  dispatch_lease_seconds: float = 60.0) -> None:
+        _validate_nonnegative_seconds(idempotency_window_seconds,
+                                      "idempotency_window_seconds")
+        _validate_nonnegative_seconds(dispatch_lease_seconds,
+                                      "dispatch_lease_seconds")
         self.journal, self.gateway = journal, gateway
         self.idempotency_window_seconds = idempotency_window_seconds
         self.dispatch_lease_seconds = dispatch_lease_seconds
@@ -403,6 +435,7 @@ class PaymentIntentBoundary:
                                   lookup_method: str, owner_token: str | None = None) -> Operation:
         reference = response.get("id")
         metadata = response.get("metadata")
+        response_amount = response.get("amount")
         currency = response.get("currency")
         valid_reference = isinstance(reference, str) and bool(reference.strip())
         same_operation = (
@@ -410,7 +443,9 @@ class PaymentIntentBoundary:
             and metadata.get("operation_id") == op.operation_id
         )
         same_amount = (
-            response.get("amount") == op.amount
+            isinstance(response_amount, int)
+            and not isinstance(response_amount, bool)
+            and response_amount == op.amount
             and isinstance(currency, str)
             and currency.lower() == op.currency
         )

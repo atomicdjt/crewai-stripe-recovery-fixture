@@ -7,6 +7,8 @@ It accompanies the discussion in [CrewAI issue #6414](https://github.com/crewAII
 ## Guarantees demonstrated
 
 - One operation ID binds one canonical amount/currency payload.
+- Amounts must be positive integers in the currency's minor unit.
+- Concurrent first use of one operation ID serializes lookup and creation so callers converge on one durable idempotency key.
 - Provider observations are append-only evidence records containing `observed_at`, `lookup_method`, `authority`, raw response, and provider reference.
 - A lost response becomes `UNKNOWN`, never `NOT_COMMITTED`.
 - The journal durably records `DISPATCHING` and the first dispatch timestamp before calling the provider. A crash after provider acceptance cannot leave a fresh `PENDING` row that looks safe to dispatch again.
@@ -16,6 +18,7 @@ It accompanies the discussion in [CrewAI issue #6414](https://github.com/crewAII
 - Uncorrelated candidate provider IDs are preserved in append-only evidence but never promoted to the operation's trusted retrieval reference.
 - The custom tool reports `payment_confirmation_attempted: false`; it does not claim that a payment completed.
 - A SQLite conditional claim under `BEGIN IMMEDIATE` assigns a unique owner token and increasing dispatch generation. While its lease is valid, a second recovery worker does not issue another retry for the same operation.
+- Recovery timing configuration rejects negative or nonfinite windows and leases; zero remains available for deterministic immediate-expiry tests.
 - Recovery rechecks both lease ownership and the original idempotency window inside the claim transaction. Stale attempts cannot release a newer dispatch owner's lease.
 - If another worker observes the original key window has expired, its refusal is appended as evidence without hiding a still-live `DISPATCHING` owner. Once that lease expires, a subsequent refusal can project `UNKNOWN` and clear the expired owner atomically, but it never authorizes a new provider request.
 - A late ambiguous `UNKNOWN` observation remains in append-only evidence but cannot overwrite a trusted `INTENT_CREATED` projection. Conflicting trusted provider references likewise require review instead of silent replacement.
