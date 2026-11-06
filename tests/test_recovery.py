@@ -14,6 +14,47 @@ class RecoveryTests(unittest.TestCase):
         self.boundary = PaymentIntentBoundary(self.journal, self.gateway)
     def tearDown(self):
         self.journal.db.close(); os.unlink(self.tmp.name)
+
+    def test_begin_commit_failure_rolls_back_or_retries_idempotently(self):
+        class CommitFailureConnection:
+            def __init__(self, connection, fail_after_commit):
+                self.connection = connection
+                self.fail_after_commit = fail_after_commit
+
+            def commit(self):
+                if self.fail_after_commit:
+                    self.connection.commit()
+                raise sqlite3.OperationalError("simulated commit failure")
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+        for fail_after_commit in (False, True):
+            with self.subTest(fail_after_commit=fail_after_commit):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = os.path.join(directory, "journal.sqlite3")
+                    journal = OperationJournal(path)
+                    connection = journal.db
+                    journal.db = CommitFailureConnection(connection, fail_after_commit)
+                    try:
+                        with self.assertRaises(sqlite3.OperationalError):
+                            journal.begin(
+                                amount=500, currency="usd", operation_id="commit-retry"
+                            )
+                        journal.db = connection
+                        self.assertFalse(connection.in_transaction)
+                        result = journal.begin(
+                            amount=500, currency="usd", operation_id="commit-retry"
+                        )
+                        self.assertEqual(result.state, EffectState.PENDING)
+                        self.assertEqual(connection.execute(
+                            "SELECT COUNT(*) FROM operations WHERE operation_id=?",
+                            ("commit-retry",),
+                        ).fetchone()[0], 1)
+                    finally:
+                        journal.db = connection
+                        connection.close()
+
     def test_lost_create_response_is_unknown_not_not_committed(self):
         self.gateway.lose_next_create_response = True
         op = self.boundary.create(amount=500, operation_id="lost")

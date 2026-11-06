@@ -22,6 +22,77 @@ class StaticGateway:
 
 
 class EvidenceContractTests(unittest.TestCase):
+    def test_amount_must_be_a_positive_integer_before_journaling_or_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = OperationJournal(Path(directory) / "journal.sqlite3")
+            gateway = StaticGateway({
+                "id": "pi_unused", "amount": 500, "currency": "usd",
+                "metadata": {"operation_id": "unused"},
+            })
+            try:
+                boundary = PaymentIntentBoundary(journal, gateway)
+                for amount in (-1, 0, 1.5, True):
+                    with self.subTest(amount=amount):
+                        with self.assertRaises(ValueError):
+                            boundary.create(amount=amount, operation_id=f"amount-{amount}")
+                self.assertEqual(gateway.create_calls, 0)
+                self.assertEqual(journal.db.execute(
+                    "SELECT COUNT(*) FROM operations"
+                ).fetchone()[0], 0)
+            finally:
+                journal.db.close()
+
+    def test_provider_amount_must_be_an_integer_to_promote_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = OperationJournal(Path(directory) / "journal.sqlite3")
+            try:
+                for provider_amount in (1.0, True):
+                    with self.subTest(provider_amount=provider_amount):
+                        gateway = StaticGateway({
+                            "id": f"pi_amount_{provider_amount}",
+                            "amount": provider_amount,
+                            "currency": "usd",
+                            "metadata": {"operation_id": f"provider-amount-{provider_amount}"},
+                        })
+                        result = PaymentIntentBoundary(journal, gateway).create(
+                            amount=1,
+                            operation_id=f"provider-amount-{provider_amount}",
+                        )
+                        self.assertEqual(result.state, EffectState.UNKNOWN)
+                        self.assertIsNone(result.provider_reference)
+                        self.assertEqual(gateway.create_calls, 1)
+            finally:
+                journal.db.close()
+
+    def test_recovery_durations_reject_negative_and_nonfinite_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = OperationJournal(Path(directory) / "journal.sqlite3")
+            try:
+                for name, value in (
+                    ("idempotency_window_seconds", -1),
+                    ("idempotency_window_seconds", float("inf")),
+                    ("dispatch_lease_seconds", -1),
+                    ("dispatch_lease_seconds", float("nan")),
+                ):
+                    with self.subTest(name=name, value=value):
+                        with self.assertRaises(ValueError):
+                            PaymentIntentBoundary(journal, StaticGateway({}), **{name: value})
+                # Zero is retained for deterministic immediate-expiry tests.
+                PaymentIntentBoundary(
+                    journal, StaticGateway({}),
+                    idempotency_window_seconds=0, dispatch_lease_seconds=0,
+                )
+                op = journal.begin(amount=500, currency="usd", operation_id="bad-duration")
+                with self.assertRaises(ValueError):
+                    journal.begin_dispatch(op.operation_id, lease_seconds=-1)
+                with self.assertRaises(ValueError):
+                    journal.claim_retry_dispatch(
+                        op.operation_id, idempotency_window_seconds=-1
+                    )
+                self.assertEqual(journal.get(op.operation_id).state, EffectState.PENDING)
+            finally:
+                journal.db.close()
+
     def test_generic_observer_cannot_assert_not_committed(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = OperationJournal(Path(directory) / "journal.sqlite3")
